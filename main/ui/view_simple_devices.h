@@ -5,7 +5,6 @@
 #include "ui/ui_state.h"
 
 ui_device_view_t *ui_inverter_view_create(ui_state_t *ui, lv_obj_t *parent);
-ui_device_view_t *ui_dcdc_converter_view_create(ui_state_t *ui, lv_obj_t *parent);
 ui_device_view_t *ui_smart_lithium_view_create(ui_state_t *ui, lv_obj_t *parent);
 ui_device_view_t *ui_inverter_rs_view_create(ui_state_t *ui, lv_obj_t *parent);
 ui_device_view_t *ui_ac_charger_view_create(ui_state_t *ui, lv_obj_t *parent);

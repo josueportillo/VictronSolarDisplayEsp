@@ -2,6 +2,7 @@
 
 #include "view_solar_charger.h"
 #include "view_battery_monitor.h"
+#include "view_dcdc_converter.h"
 #include "view_simple_devices.h"
 #include "esp_log.h"
 
