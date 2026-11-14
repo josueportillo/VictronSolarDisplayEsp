@@ -21,6 +21,112 @@
 
 #define DEBUG_NAMESPACE       "debug"
 #define VICTRON_DEBUG_KEY     "victron_debug"
+#define DEVICE_NAMESPACE      "victron_devices"
+#define DEVICE_CONFIGS_KEY    "configs"
+
+static bool mac_is_zero(const uint8_t mac[6]) {
+    for (int i = 0; i < 6; ++i) {
+        if (mac[i] != 0) return false;
+    }
+    return true;
+}
+
+static bool key_is_zero(const uint8_t key[16]) {
+    for (int i = 0; i < 16; ++i) {
+        if (key[i] != 0) return false;
+    }
+    return true;
+}
+
+// Migrate the legacy single AES key (namespace "victron"/"aes_key") into slot 0
+// if the slot table is empty/unused and a legacy key exists.
+static void migrate_legacy_aes_key(victron_device_config_t *configs, size_t max_devices)
+{
+    if (configs == NULL || max_devices == 0) {
+        return;
+    }
+
+    uint8_t legacy_key[16] = {0};
+    if (load_aes_key(legacy_key) != ESP_OK || key_is_zero(legacy_key)) {
+        return;
+    }
+
+    // Only migrate if slot 0 has no key configured yet.
+    if (!key_is_zero(configs[0].aes_key)) {
+        return;
+    }
+
+    memcpy(configs[0].aes_key, legacy_key, 16);
+    configs[0].enabled = 1;
+    configs[0].record_type = 0; // auto
+    if (configs[0].name[0] == '\0') {
+        strncpy(configs[0].name, "Device 1", VICTRON_DEVICE_NAME_MAX - 1);
+    }
+}
+
+esp_err_t load_device_configs(victron_device_config_t *configs, size_t max_devices)
+{
+    if (configs == NULL || max_devices == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Defaults: all disabled, auto type, empty name, zero key/mac.
+    for (size_t i = 0; i < max_devices; ++i) {
+        memset(&configs[i], 0, sizeof(configs[i]));
+        configs[i].enabled = 0;
+        configs[i].record_type = 0;
+        configs[i].name[0] = '\0';
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(DEVICE_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        // No device configs yet -> try legacy migration into slot 0.
+        migrate_legacy_aes_key(configs, max_devices);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t blob_size = max_devices * sizeof(victron_device_config_t);
+    err = nvs_get_blob(h, DEVICE_CONFIGS_KEY, configs, &blob_size);
+    nvs_close(h);
+
+    if (err != ESP_OK) {
+        // Blob missing/corrupt -> reset defaults and migrate legacy.
+        for (size_t i = 0; i < max_devices; ++i) {
+            memset(&configs[i], 0, sizeof(configs[i]));
+            configs[i].enabled = 0;
+            configs[i].record_type = 0;
+            configs[i].name[0] = '\0';
+        }
+        migrate_legacy_aes_key(configs, max_devices);
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t save_device_configs(const victron_device_config_t *configs, size_t count)
+{
+    if (configs == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count > VICTRON_MAX_DEVICES) {
+        count = VICTRON_MAX_DEVICES;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(DEVICE_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_blob(h, DEVICE_CONFIGS_KEY, configs, count * sizeof(victron_device_config_t));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
 
 esp_err_t load_brightness(uint8_t *brightness_out) {
     nvs_handle_t h;

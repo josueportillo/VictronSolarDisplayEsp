@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <dirent.h>
 #include "esp_netif.h"
 #include "esp_netif_types.h"
@@ -234,11 +235,48 @@ static esp_err_t handle_static(httpd_req_t *req) {
     return serve_from_spiffs(req, req->uri);
 }
 
-// Fallback form for POST /save (AES key)
+// URL-decode a form value in place (spaces + %XX).
+static void url_decode_in_place(char *s)
+{
+    if (s == NULL) return;
+    char *r = s;
+    while (*s) {
+        if (*s == '+') {
+            *r++ = ' ';
+            s++;
+        } else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+            char tmp[3] = { s[1], s[2], 0 };
+            *r++ = (char)strtol(tmp, NULL, 16);
+            s += 3;
+        } else {
+            *r++ = *s++;
+        }
+    }
+    *r = '\0';
+}
+
+static bool is_hex_string(const char *s, size_t len)
+{
+    if (s == NULL) return false;
+    for (size_t i = 0; i < len; ++i) {
+        if (!isxdigit((unsigned char)s[i])) return false;
+    }
+    return true;
+}
+
+static void hex_to_bin(const char *hex, uint8_t out[16])
+{
+    for (int i = 0; i < 16; ++i) {
+        char tmp[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+        out[i] = (uint8_t)strtol(tmp, NULL, 16);
+    }
+}
+
+// Handler for POST /save (3-device config: name0/type0/key0 ... name2/type2/key2)
 static esp_err_t post_save(httpd_req_t *req) {
     ESP_LOGV(TAG, "HTTP POST /save");
     size_t len = req->content_len;
-    if (!len || len > 64) {
+    if (!len || len > 2048) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid length");
         return ESP_FAIL;
     }
@@ -247,16 +285,56 @@ static esp_err_t post_save(httpd_req_t *req) {
     int ret = httpd_req_recv(req, body, len);
     if (ret <= 0) { free(body); return ESP_FAIL; }
     body[ret] = '\0';
-    char *hex = strchr(body, '=');
-    if (!hex || strlen(hex+1) != 32) { free(body); return ESP_FAIL; }
-    hex++;
-    uint8_t key[16];
-    for (int i = 0; i < 16; i++) {
-        char tmp[3] = { hex[i*2], hex[i*2+1], 0 };
-        key[i] = strtol(tmp, NULL, 16);
+
+    // Load existing configs so auto-learned MACs are preserved.
+    victron_device_config_t configs[VICTRON_MAX_DEVICES];
+    load_device_configs(configs, VICTRON_MAX_DEVICES);
+
+    char name[VICTRON_MAX_DEVICES][VICTRON_DEVICE_NAME_MAX];
+    char keyhex[VICTRON_MAX_DEVICES][33];
+    uint8_t type[VICTRON_MAX_DEVICES];
+    for (int i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        name[i][0] = '\0';
+        keyhex[i][0] = '\0';
+        type[i] = 0;
     }
-    ESP_LOGI(TAG, "Parsed AES key:"); ESP_LOG_BUFFER_HEX(TAG, key, 16);
-    save_aes_key(key);
+
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(body, "&", &saveptr); tok; tok = strtok_r(NULL, "&", &saveptr)) {
+        char *eq = strchr(tok, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *field = tok;
+        char *val = eq + 1;
+        url_decode_in_place(val);
+
+        int idx = -1;
+        if (sscanf(field, "name%d", &idx) == 1 && idx >= 0 && idx < VICTRON_MAX_DEVICES) {
+            strncpy(name[idx], val, VICTRON_DEVICE_NAME_MAX - 1);
+            name[idx][VICTRON_DEVICE_NAME_MAX - 1] = '\0';
+        } else if (sscanf(field, "type%d", &idx) == 1 && idx >= 0 && idx < VICTRON_MAX_DEVICES) {
+            type[idx] = (uint8_t)strtol(val, NULL, 10);
+        } else if (sscanf(field, "key%d", &idx) == 1 && idx >= 0 && idx < VICTRON_MAX_DEVICES) {
+            strncpy(keyhex[idx], val, 32);
+            keyhex[idx][32] = '\0';
+        }
+    }
+
+    for (int i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        if (strlen(keyhex[i]) == 32 && is_hex_string(keyhex[i], 32)) {
+            configs[i].enabled = 1;
+            hex_to_bin(keyhex[i], configs[i].aes_key);
+            configs[i].record_type = type[i];
+            if (name[i][0] != '\0') {
+                strncpy(configs[i].name, name[i], VICTRON_DEVICE_NAME_MAX - 1);
+                configs[i].name[VICTRON_DEVICE_NAME_MAX - 1] = '\0';
+            }
+        } else {
+            configs[i].enabled = 0;
+        }
+    }
+
+    save_device_configs(configs, VICTRON_MAX_DEVICES);
     free(body);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, "<h3>Saved. Rebooting...</h3>", HTTPD_RESP_USE_STRLEN);

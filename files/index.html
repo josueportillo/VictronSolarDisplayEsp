@@ -38,20 +38,61 @@
     </div>
   </div>
   <div class="center-content">
-    <h1>Victron AES Key Configuration</h1>
-    <!-- AES Key Form -->
+    <h1>Victron Device Configuration</h1>
+    <!-- 3-Device Config Form -->
     <form id="keyForm">
-      <label for="key">Enter 16-byte AES Key (32 hex chars):</label><br/>
-      <input type="text"
-             id="key"
-             name="key"
-             minlength="32"
-             maxlength="32"
-             pattern="[0-9A-Fa-f]{32}"
-             placeholder="4B7178E64C828A262CDD5161E3404B7A"
-             required
-             autocomplete="off"/><br/>
-      <button type="submit">Save Key</button>
+      <div class="device-block">
+        <h2>Device 1</h2>
+        <label>Name: <input type="text" name="name0" maxlength="19" placeholder="SmartShunt"/></label><br/>
+        <label>Type:
+          <select name="type0">
+            <option value="0">Auto</option>
+            <option value="2">Battery Monitor</option>
+            <option value="4">DC/DC Converter</option>
+            <option value="1">Solar Charger</option>
+            <option value="15">Orion XS</option>
+          </select>
+        </label><br/>
+        <label>AES Key (32 hex):
+          <input type="text" name="key0" class="key-input" minlength="32" maxlength="32"
+                 pattern="[0-9A-Fa-f]{32}" placeholder="32 hex chars" autocomplete="off"/>
+        </label>
+      </div>
+      <div class="device-block">
+        <h2>Device 2</h2>
+        <label>Name: <input type="text" name="name1" maxlength="19" placeholder="Orion DC-DC"/></label><br/>
+        <label>Type:
+          <select name="type1">
+            <option value="0">Auto</option>
+            <option value="2">Battery Monitor</option>
+            <option value="4">DC/DC Converter</option>
+            <option value="1">Solar Charger</option>
+            <option value="15">Orion XS</option>
+          </select>
+        </label><br/>
+        <label>AES Key (32 hex):
+          <input type="text" name="key1" class="key-input" minlength="32" maxlength="32"
+                 pattern="[0-9A-Fa-f]{32}" placeholder="32 hex chars" autocomplete="off"/>
+        </label>
+      </div>
+      <div class="device-block">
+        <h2>Device 3</h2>
+        <label>Name: <input type="text" name="name2" maxlength="19" placeholder="BlueSolar MPPT"/></label><br/>
+        <label>Type:
+          <select name="type2">
+            <option value="0">Auto</option>
+            <option value="2">Battery Monitor</option>
+            <option value="4">DC/DC Converter</option>
+            <option value="1">Solar Charger</option>
+            <option value="15">Orion XS</option>
+          </select>
+        </label><br/>
+        <label>AES Key (32 hex):
+          <input type="text" name="key2" class="key-input" minlength="32" maxlength="32"
+                 pattern="[0-9A-Fa-f]{32}" placeholder="32 hex chars" autocomplete="off"/>
+        </label>
+      </div>
+      <button type="submit">Save Devices</button>
     </form>
     <div id="response"></div>
   </div>
@@ -64,7 +105,7 @@
         var form = this;
         $.post('/save', $(form).serialize())
           .done(function() { $('#response').text('Saved! Rebooting…'); })
-          .fail(function() { $('#response').text('Error saving key.'); });
+          .fail(function() { $('#response').text('Error saving devices.'); });
         triggerExplosion(form.querySelector('button'));
         setTimeout(triggerSpiralParticleCollect, 4000);
     });
@@ -251,10 +292,10 @@ function hexCharHint(el) {
     setTimeout(() => span.remove(), 5000);
 }
 
-// Hook into your input validation
-const keyInput = document.getElementById('key');
+// Hook into key input validation
 const keyForm = document.getElementById('keyForm');
-keyInput.addEventListener('input', function(e) {
+document.querySelectorAll('.key-input').forEach(function(keyInput) {
+  keyInput.addEventListener('input', function(e) {
     let val = keyInput.value.toUpperCase().replace(/[^0-9A-F]/g, '');
     if (val !== keyInput.value.toUpperCase()) {
         keyInput.value = val;
@@ -263,6 +304,7 @@ keyInput.addEventListener('input', function(e) {
         keyForm.classList.add('red-glow');
         hexCharHint(keyForm); // <-- show hex char hint
     }
+  });
 });
 keyForm.addEventListener('animationend', function() {
     keyForm.classList.remove('red-glow');

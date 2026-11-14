@@ -26,9 +26,6 @@ static const char *TAG_UI = "UI_MODULE";
 
 static ui_state_t g_ui = {
     .brightness = 100,
-    .current_device_type = VICTRON_BLE_RECORD_TEST,
-    .current_product_id = 0,
-    .has_received_data = false,
     .tab_settings_index = UINT16_MAX,
     .tab_relay_index = UINT16_MAX,
     .relay_tab_enabled = true,
@@ -36,7 +33,7 @@ static ui_state_t g_ui = {
 
 // Forward declarations
 static void tabview_touch_event_cb(lv_event_t *e);
-static void ensure_device_layout(ui_state_t *ui, victron_record_type_t type);
+static void ensure_device_layout(ui_state_t *ui, size_t slot, victron_record_type_t type);
 static const char *device_type_name(victron_record_type_t type);
 
 static bool obj_is_descendant(const lv_obj_t *obj, const lv_obj_t *parent)
@@ -60,10 +57,15 @@ void ui_init(void) {
     nvs_flash_init();
     load_brightness(&ui->brightness);
 
-    ui->active_view = NULL;
-    ui->current_device_type = VICTRON_BLE_RECORD_TEST;
-    for (size_t i = 0; i < UI_MAX_DEVICE_VIEWS; ++i) {
-        ui->views[i] = NULL;
+    // Load per-device configs (migrates legacy single key into slot 0).
+    load_device_configs(ui->device_config, VICTRON_MAX_DEVICES);
+
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        ui->slots[i].tab = NULL;
+        ui->slots[i].lbl_no_data = NULL;
+        ui->slots[i].active_view = NULL;
+        ui->slots[i].current_device_type = VICTRON_BLE_RECORD_TEST;
+        ui->slots[i].has_received_data = false;
     }
 
     ui->relay_config.count = 0;
@@ -152,18 +154,30 @@ void ui_init(void) {
     );
 #endif
 
-    ui->tabview   = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 32);
-    ui->tab_live  = lv_tabview_add_tab(ui->tabview, "Live");
+    ui->tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 32);
+
+    // --- Device tabs (one per configured device) ---
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        char tab_name[VICTRON_DEVICE_NAME_MAX];
+        if (ui->device_config[i].name[0] != '\0') {
+            snprintf(tab_name, sizeof(tab_name), "%s", ui->device_config[i].name);
+        } else {
+            snprintf(tab_name, sizeof(tab_name), "Device %u", (unsigned)(i + 1));
+        }
+        ui->slots[i].tab = lv_tabview_add_tab(ui->tabview, tab_name);
+    }
+
     ui->tab_settings = lv_tabview_add_tab(ui->tabview, "Settings");
     ui->tab_relay = lv_tabview_add_tab(ui->tabview, "Relay");
 
     ui->tab_settings_index = lv_obj_get_index(ui->tab_settings);
     ui->tab_relay_index = lv_obj_get_index(ui->tab_relay);
 
-    lv_obj_add_event_cb(ui->tab_live, tabview_touch_event_cb, LV_EVENT_PRESSED, ui);
-    lv_obj_add_event_cb(ui->tab_live, tabview_touch_event_cb, LV_EVENT_CLICKED, ui);
-    lv_obj_add_event_cb(ui->tab_live, tabview_touch_event_cb, LV_EVENT_GESTURE, ui);
-
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        lv_obj_add_event_cb(ui->slots[i].tab, tabview_touch_event_cb, LV_EVENT_PRESSED, ui);
+        lv_obj_add_event_cb(ui->slots[i].tab, tabview_touch_event_cb, LV_EVENT_CLICKED, ui);
+        lv_obj_add_event_cb(ui->slots[i].tab, tabview_touch_event_cb, LV_EVENT_GESTURE, ui);
+    }
     lv_obj_add_event_cb(ui->tab_settings, tabview_touch_event_cb, LV_EVENT_PRESSED, ui);
     lv_obj_add_event_cb(ui->tab_settings, tabview_touch_event_cb, LV_EVENT_CLICKED, ui);
     lv_obj_add_event_cb(ui->tab_settings, tabview_touch_event_cb, LV_EVENT_GESTURE, ui);
@@ -179,11 +193,10 @@ void ui_init(void) {
 
     // Styles
     lv_style_init(&ui->styles.small);
-    /* Use montserrat 22 for titles as requested */
 #if LV_FONT_MONTSERRAT_22
     lv_style_set_text_font(&ui->styles.small, &lv_font_montserrat_22);
 #else
-    lv_style_set_text_font(&ui->styles.title, &lv_font_montserrat_16);
+    lv_style_set_text_font(&ui->styles.small, &lv_font_montserrat_16);
 #endif
     lv_style_set_text_color(&ui->styles.small, lv_color_white());
 
@@ -205,13 +218,20 @@ void ui_init(void) {
 #endif
     lv_style_set_text_color(&ui->styles.value, lv_color_white());
 
-    ui->lbl_no_data = lv_label_create(ui->tab_live);
-    lv_label_set_text(ui->lbl_no_data, "No live data received yet");
-    lv_obj_add_style(ui->lbl_no_data, &ui->styles.medium, 0);
-    lv_label_set_long_mode(ui->lbl_no_data, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(ui->lbl_no_data, lv_pct(90));
-    lv_obj_set_style_text_align(ui->lbl_no_data, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(ui->lbl_no_data);
+    // Per-device "no data" labels.
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        ui->slots[i].lbl_no_data = lv_label_create(ui->slots[i].tab);
+        if (ui->device_config[i].enabled) {
+            lv_label_set_text(ui->slots[i].lbl_no_data, "No live data received yet");
+        } else {
+            lv_label_set_text(ui->slots[i].lbl_no_data, "Device disabled");
+        }
+        lv_obj_add_style(ui->slots[i].lbl_no_data, &ui->styles.medium, 0);
+        lv_label_set_long_mode(ui->slots[i].lbl_no_data, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(ui->slots[i].lbl_no_data, lv_pct(90));
+        lv_obj_set_style_text_align(ui->slots[i].lbl_no_data, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(ui->slots[i].lbl_no_data);
+    }
 
     ui_settings_panel_init(ui, default_ssid, default_pass, ap_enabled);
     ui_relay_panel_init(ui);
@@ -232,23 +252,28 @@ void ui_on_panel_data(const victron_data_t *d) {
         return;
     }
 
-    ui_state_t *ui = &g_ui;
+    uint8_t slot = d->slot;
+    if (slot >= VICTRON_MAX_DEVICES) {
+        return;
+    }
 
+    ui_state_t *ui = &g_ui;
     lvgl_port_lock(0);
 
-    if (!ui->has_received_data) {
-        ui->has_received_data = true;
-        if (ui->lbl_no_data) {
-            lv_obj_add_flag(ui->lbl_no_data, LV_OBJ_FLAG_HIDDEN);
+    ui_device_slot_t *s = &ui->slots[slot];
+
+    if (!s->has_received_data) {
+        s->has_received_data = true;
+        if (s->lbl_no_data) {
+            lv_obj_add_flag(s->lbl_no_data, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
+    // Update the "latest device" info labels on the System page.
     const char *type_str = device_type_name(d->type);
     if (ui->lbl_device_type) {
         lv_label_set_text_fmt(ui->lbl_device_type, "Device: %s", type_str);
     }
-
-    ui->current_product_id = d->product_id;
     if (ui->lbl_product_name) {
         if (d->product_id != 0) {
             const char *prod_name = victron_product_name(d->product_id);
@@ -267,16 +292,10 @@ void ui_on_panel_data(const victron_data_t *d) {
         }
     }
 
-    ensure_device_layout(ui, d->type);
+    ensure_device_layout(ui, slot, d->type);
 
-    if (ui->active_view && ui->active_view->update) {
-        ui->active_view->update(ui->active_view, d);
-    } else if (ui->lbl_error) {
-        if (d->type == VICTRON_BLE_RECORD_TEST) {
-            lv_label_set_text(ui->lbl_error, "Unknown device type");
-        } else {
-            lv_label_set_text(ui->lbl_error, "No renderer for device type");
-        }
+    if (s->active_view && s->active_view->update) {
+        s->active_view->update(s->active_view, d);
     }
 
     lvgl_port_unlock();
@@ -288,43 +307,52 @@ void ui_notify_user_activity(void)
     ui_settings_panel_on_user_activity(ui);
 }
 
-void ui_set_ble_mac(const uint8_t *mac) {
-    // Format MAC as "XX:XX:XX:XX:XX:XX"
-    char mac_str[18];
-    snprintf(mac_str, sizeof(mac_str),
-             "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
-    ui_state_t *ui = &g_ui;
-    lvgl_port_lock(0);
-    ui_settings_panel_set_mac(ui, mac_str);
-    lvgl_port_unlock();
+void ui_rename_device_tab(ui_state_t *ui, size_t slot, const char *name)
+{
+    if (ui == NULL || ui->tabview == NULL || slot >= VICTRON_MAX_DEVICES) {
+        return;
+    }
+    lv_tabview_rename_tab(ui->tabview, (uint32_t)slot, name ? name : "");
 }
 
-static void ensure_device_layout(ui_state_t *ui, victron_record_type_t type)
+static void ensure_device_layout(ui_state_t *ui, size_t slot, victron_record_type_t type)
 {
-    if (ui == NULL) {
+    if (ui == NULL || slot >= VICTRON_MAX_DEVICES) {
         return;
     }
 
-    if (type == ui->current_device_type) {
+    ui_device_slot_t *s = &ui->slots[slot];
+
+    if (s->active_view != NULL && type == s->current_device_type) {
         return;
     }
 
-    if (ui->active_view && ui->active_view->hide) {
-        ui->active_view->hide(ui->active_view);
+    // Destroy any existing view for a different type.
+    if (s->active_view != NULL) {
+        if (s->active_view->destroy) {
+            s->active_view->destroy(s->active_view);
+        }
+        s->active_view = NULL;
     }
 
-    ui->active_view = NULL;
-
-    ui_device_view_t *view = ui_view_registry_ensure(ui, type, ui->tab_live);
-    if (view && view->show) {
-        view->show(view);
-        ui->active_view = view;
-    } else if (type != VICTRON_BLE_RECORD_TEST) {
-        ESP_LOGW(TAG_UI, "No view available for device type 0x%02X", (unsigned)type);
+    const ui_view_descriptor_t *desc = ui_view_registry_find(type);
+    if (desc != NULL && desc->create != NULL && s->tab != NULL) {
+        ui_device_view_t *view = desc->create(ui, s->tab);
+        if (view != NULL) {
+            if (view->show) {
+                view->show(view);
+            }
+            s->active_view = view;
+        } else {
+            ESP_LOGW(TAG_UI, "Failed to create view for type 0x%02X (slot %u)",
+                     (unsigned)type, (unsigned)slot);
+        }
+    } else {
+        ESP_LOGW(TAG_UI, "No view available for device type 0x%02X (slot %u)",
+                 (unsigned)type, (unsigned)slot);
     }
 
-    ui->current_device_type = type;
+    s->current_device_type = type;
 }
 
 static const char *device_type_name(victron_record_type_t type)

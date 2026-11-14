@@ -75,6 +75,9 @@ build/
 /flash_bootloader_args
 /flash_project_args
 /flasher_args.json
+/otadata-flash_args
+/spiffs-flash_args
+/spiffs-flash_args.in
 /partition-table-flash_args
 /kconfigs.in
 /kconfig.projbuild.in

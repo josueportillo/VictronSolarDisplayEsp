@@ -12,6 +12,8 @@
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "aes/esp_aes.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "victron_ble";
 
@@ -25,7 +27,15 @@ static bool victron_debug_enabled = false;
 #define NA_U10          0x3FF
 #define NA_U22          0x3FFFFF
 
-static uint8_t aes_key[16];
+// Fallback key used when an enabled slot has no explicit key configured.
+static const uint8_t DEFAULT_AES_KEY[16] = {
+    0x4B,0x71,0x78,0xE6, 0x4C,0x82,0x8A,0x26,
+    0x2C,0xDD,0x51,0x61, 0xE3,0x40,0x4B,0x7A
+};
+
+// Per-slot device configuration (mirrors NVS, plus auto-learned MACs).
+static victron_device_config_t g_devices[VICTRON_MAX_DEVICES];
+static SemaphoreHandle_t g_devices_mutex = NULL;
 
 typedef enum {
     VICTRON_MANUFACTURER_RECORD_PRODUCT_ADVERTISEMENT = 0x10,
@@ -56,6 +66,92 @@ static inline int32_t sign_extend(uint32_t value, uint8_t bits)
     return (int32_t)(value << shift) >> shift;
 }
 
+static bool key_is_zero(const uint8_t key[16])
+{
+    for (int i = 0; i < 16; ++i) {
+        if (key[i] != 0) return false;
+    }
+    return true;
+}
+
+static bool mac_is_zero(const uint8_t mac[6])
+{
+    for (int i = 0; i < 6; ++i) {
+        if (mac[i] != 0) return false;
+    }
+    return true;
+}
+
+// Return the effective AES key for a slot (explicit key, or default fallback).
+static void slot_effective_key(int slot, uint8_t key_out[16])
+{
+    if (slot < 0 || slot >= VICTRON_MAX_DEVICES) {
+        memcpy(key_out, DEFAULT_AES_KEY, 16);
+        return;
+    }
+    const victron_device_config_t *dev = &g_devices[slot];
+    if (key_is_zero(dev->aes_key)) {
+        memcpy(key_out, DEFAULT_AES_KEY, 16);
+    } else {
+        memcpy(key_out, dev->aes_key, 16);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Device slot routing                                                       */
+/* -------------------------------------------------------------------------- */
+
+// Find which slot a packet belongs to. Returns slot index or -1 if not ours.
+// If a packet matches an unbound slot (key[0] + record type) the MAC is
+// auto-learned (bound) and `bound_out` is set so the caller can persist.
+// Caller MUST hold g_devices_mutex.
+static int find_slot_for_packet(const uint8_t *mac,
+                                const victronManufacturerData *mdata,
+                                bool *bound_out)
+{
+    uint8_t rec_type = mdata->victronRecordType;
+
+    // 1) Exact MAC match (highest priority).
+    for (int i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        if (!g_devices[i].enabled) continue;
+        if (mac_is_zero(g_devices[i].mac)) continue;
+        if (memcmp(g_devices[i].mac, mac, 6) == 0) {
+            return i;
+        }
+    }
+
+    // 2) Auto-learn: unbound slot whose key[0] and record type both match.
+    for (int i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        if (!g_devices[i].enabled) continue;
+        if (!mac_is_zero(g_devices[i].mac)) continue; // already bound
+        if (key_is_zero(g_devices[i].aes_key)) {
+            // Uses default key; only match on record type.
+            if (g_devices[i].record_type != 0 && g_devices[i].record_type != rec_type) {
+                continue;
+            }
+            if (mdata->encryptKeyMatch != DEFAULT_AES_KEY[0]) {
+                continue;
+            }
+        } else {
+            if (mdata->encryptKeyMatch != g_devices[i].aes_key[0]) {
+                continue;
+            }
+            if (g_devices[i].record_type != 0 && g_devices[i].record_type != rec_type) {
+                continue;
+            }
+        }
+
+        // Bind the MAC to this slot.
+        memcpy(g_devices[i].mac, mac, 6);
+        ESP_LOGI(TAG, "Auto-bound slot %d to MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                 i, mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+        if (bound_out) *bound_out = true;
+        return i;
+    }
+
+    return -1;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Initialization                                                            */
 /* -------------------------------------------------------------------------- */
@@ -73,20 +169,25 @@ void victron_ble_init(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Load AES key from NVS or fallback to default
-    if (load_aes_key(aes_key) == ESP_OK) {
-        ESP_LOGI(TAG, "Loaded AES key from NVS");
+    g_devices_mutex = xSemaphoreCreateMutex();
+
+    // Load per-device configs from NVS (migrates legacy single key to slot 0).
+    if (load_device_configs(g_devices, VICTRON_MAX_DEVICES) == ESP_OK) {
+        ESP_LOGI(TAG, "Loaded %d device configs from NVS", VICTRON_MAX_DEVICES);
     } else {
-        ESP_LOGW(TAG, "No user AES key found in NVS, using default");
-        const uint8_t default_key[16] = {
-            0x4B,0x71,0x78,0xE6, 0x4C,0x82,0x8A,0x26,
-            0x2C,0xDD,0x51,0x61, 0xE3,0x40,0x4B,0x7A
-        };
-        memcpy(aes_key, default_key, sizeof(aes_key));
+        ESP_LOGW(TAG, "No device configs in NVS (legacy key migrated if present)");
     }
 
-    ESP_LOGI(TAG, "Using AES key:");
-    ESP_LOG_BUFFER_HEX(TAG, aes_key, sizeof(aes_key));
+    for (int i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        if (g_devices[i].enabled) {
+            ESP_LOGI(TAG, "Device %d: name='%s' type=0x%02X mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                     i, g_devices[i].name, g_devices[i].record_type,
+                     g_devices[i].mac[5], g_devices[i].mac[4], g_devices[i].mac[3],
+                     g_devices[i].mac[2], g_devices[i].mac[1], g_devices[i].mac[0]);
+        } else {
+            ESP_LOGI(TAG, "Device %d: disabled", i);
+        }
+    }
 
     ESP_LOGI(TAG, "Initializing NimBLE stack");
     nimble_port_init();
@@ -98,6 +199,43 @@ void victron_ble_set_debug(bool enabled)
 {
     victron_debug_enabled = enabled;
     ESP_LOGI(TAG, "Victron BLE debug set to %s", enabled ? "ENABLED" : "disabled");
+}
+
+void victron_ble_apply_device_configs(const victron_device_config_t *configs, size_t count)
+{
+    if (configs == NULL || count == 0) {
+        return;
+    }
+    if (count > VICTRON_MAX_DEVICES) {
+        count = VICTRON_MAX_DEVICES;
+    }
+    if (g_devices_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(g_devices_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(g_devices, configs, count * sizeof(victron_device_config_t));
+        xSemaphoreGive(g_devices_mutex);
+    }
+    ESP_LOGI(TAG, "Applied %d device config(s) at runtime", (int)count);
+}
+
+void victron_ble_get_device_configs(victron_device_config_t *configs, size_t max_devices)
+{
+    if (configs == NULL || max_devices == 0) {
+        return;
+    }
+    if (max_devices > VICTRON_MAX_DEVICES) {
+        max_devices = VICTRON_MAX_DEVICES;
+    }
+    if (g_devices_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(g_devices_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        memcpy(configs, g_devices, max_devices * sizeof(victron_device_config_t));
+        xSemaphoreGive(g_devices_mutex);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -199,14 +337,41 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
     VDBG("Vendor ID: 0x%04X, Record: 0x%02X (%s)",
          mdata->vendorID, mdata->victronRecordType,
          get_device_type_name(mdata->victronRecordType));
-    VDBG("Nonce: 0x%04X, KeyMatch: 0x%02X (local[0]=0x%02X)",
-         mdata->nonceDataCounter, mdata->encryptKeyMatch, aes_key[0]);
-    if (victron_debug_enabled)
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, fields.mfg_data, fields.mfg_data_len, ESP_LOG_INFO);
+
+    // --- Route packet to a configured device slot (MAC match / auto-learn) ---
+    const uint8_t *src_mac = event->disc.addr.val;
+    int slot;
+    bool bound = false;
+
+    if (g_devices_mutex == NULL) {
+        return 0;
+    }
+
+    xSemaphoreTake(g_devices_mutex, portMAX_DELAY);
+    slot = find_slot_for_packet(src_mac, mdata, &bound);
+
+    // Snapshot the effective key while holding the lock.
+    uint8_t aes_key[16];
+    slot_effective_key(slot, aes_key);
+    xSemaphoreGive(g_devices_mutex);
+
+    if (slot < 0) {
+        return 0; // not a configured device
+    }
+
+    // Persist any auto-learned MAC (best-effort, outside the lock).
+    if (bound) {
+        victron_device_config_t snapshot[VICTRON_MAX_DEVICES];
+        victron_ble_get_device_configs(snapshot, VICTRON_MAX_DEVICES);
+        save_device_configs(snapshot, VICTRON_MAX_DEVICES);
+    }
+
+    VDBG("Nonce: 0x%04X, KeyMatch: 0x%02X (slot[%d] key[0]=0x%02X)",
+         mdata->nonceDataCounter, mdata->encryptKeyMatch, slot, aes_key[0]);
 
     if (mdata->encryptKeyMatch != aes_key[0]) {
-        ESP_LOGW(TAG, "Key mismatch! Device key[0]=0x%02X, ours=0x%02X - skipping decrypt",
-                 mdata->encryptKeyMatch, aes_key[0]);
+        ESP_LOGW(TAG, "Key mismatch! Device key[0]=0x%02X, slot[%d] key[0]=0x%02X - skipping decrypt",
+                 mdata->encryptKeyMatch, slot, aes_key[0]);
         return 0;
     }
 
@@ -252,7 +417,6 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, output, encr_size, ESP_LOG_INFO);
     }
 
-    ui_set_ble_mac(event->disc.addr.val);
     const victron_record_type_t rec_type = (victron_record_type_t)mdata->victronRecordType;
 
     /* ---------------- Record Parsing ---------------- */
@@ -263,7 +427,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             uint16_t load_raw = (uint16_t)output[10] | ((uint16_t)(output[11] & 0x01) << 8);
             float load_current_A = (load_raw == 0x1FF) ? 0.0f : load_raw / 10.0f;
 
-            ESP_LOGI(TAG, "=== SmartSolar Charger ===");
+            ESP_LOGI(TAG, "=== SmartSolar Charger (slot %d) ===", slot);
             ESP_LOGI(TAG, "Vbat=%.2fV Ibat=%.1fA PV=%uW Yield=%.2fkWh Load=%.1fA",
                      r->battery_voltage_centi / 100.0f,
                      r->battery_current_deci / 10.0f,
@@ -274,8 +438,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             if (data_cb) {
                 victron_data_t parsed = {
                     .type = VICTRON_BLE_RECORD_SOLAR_CHARGER,
-                    .product_id = product_id
+                    .product_id = product_id,
+                    .slot = (uint8_t)slot
                 };
+                memcpy(parsed.mac, src_mac, 6);
                 parsed.record.solar.device_state = r->device_state;
                 parsed.record.solar.charger_error = r->charger_error;
                 parsed.record.solar.battery_voltage_centi = r->battery_voltage_centi;
@@ -307,7 +473,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
 
             float current_A   = current_bits / 1000.0f;
 
-            ESP_LOGI(TAG, "=== Battery Monitor ===");
+            ESP_LOGI(TAG, "=== Battery Monitor (slot %d) ===", slot);
             ESP_LOGI(TAG, "Vbat=%.2fV Ibat=%.3fA SOC=%.1f%% TTG=%u min",
                      voltage_raw / 100.0f, current_A, soc_bits / 10.0f, ttg_raw);
             ESP_LOGI(TAG, "Aux=%u (%.2fV), Alarm=0x%04X",
@@ -316,8 +482,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             if (data_cb) {
                 victron_data_t parsed = {
                     .type = VICTRON_BLE_RECORD_BATTERY_MONITOR,
-                    .product_id = product_id
+                    .product_id = product_id,
+                    .slot = (uint8_t)slot
                 };
+                memcpy(parsed.mac, src_mac, 6);
                 parsed.record.battery.time_to_go_minutes = ttg_raw;
                 parsed.record.battery.battery_voltage_centi = voltage_raw;
                 parsed.record.battery.alarm_reason = alarm_raw;
@@ -350,7 +518,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             uint16_t ac_voltage_centi = (uint16_t)(tail & 0x7FFFu);
             uint16_t ac_current_deci = (uint16_t)((tail >> 15) & 0x7FFu);
 
-            ESP_LOGI(TAG, "=== Inverter ===");
+            ESP_LOGI(TAG, "=== Inverter (slot %d) ===", slot);
             ESP_LOGI(TAG, "Vbat=%.2fV AC=%.2fV Iac=%.1fA P=%uVA",
                      battery_voltage_centi / 100.0f,
                      ac_voltage_centi / 100.0f,
@@ -360,8 +528,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             if (data_cb) {
                 victron_data_t parsed = {
                     .type = VICTRON_BLE_RECORD_INVERTER,
-                    .product_id = product_id
+                    .product_id = product_id,
+                    .slot = (uint8_t)slot
                 };
+                memcpy(parsed.mac, src_mac, 6);
                 parsed.record.inverter.device_state = device_state;
                 parsed.record.inverter.alarm_reason = alarm_reason;
                 parsed.record.inverter.battery_voltage_centi = battery_voltage_centi;
@@ -389,7 +559,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
                                 | ((uint32_t)b[8] << 16)
                                 | ((uint32_t)b[9] << 24);
 
-            ESP_LOGI(TAG, "=== DC/DC Converter ===");
+            ESP_LOGI(TAG, "=== DC/DC Converter (slot %d) ===", slot);
             ESP_LOGI(TAG, "State=%u Error=0x%02X Vin=%.2fV Vout=%.2fV OffReason=0x%08lX",
                      (unsigned)device_state,
                      (unsigned)charger_error,
@@ -400,8 +570,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             if (data_cb) {
                 victron_data_t parsed = {
                     .type = VICTRON_BLE_RECORD_DCDC_CONVERTER,
-                    .product_id = product_id
+                    .product_id = product_id,
+                    .slot = (uint8_t)slot
                 };
+                memcpy(parsed.mac, src_mac, 6);
                 parsed.record.dcdc.device_state = device_state;
                 parsed.record.dcdc.charger_error = charger_error;
                 parsed.record.dcdc.input_voltage_centi = input_voltage_centi;
@@ -434,7 +606,7 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             uint8_t temperature_raw = (encr_size > 16) ? b[16] : 0;
             int temperature_c = (int)temperature_raw - 40;
 
-            ESP_LOGI(TAG, "=== Smart Lithium ===");
+            ESP_LOGI(TAG, "=== Smart Lithium (slot %d) ===", slot);
             ESP_LOGI(TAG, "Flags=0x%08lX Err=0x%04X Batt=%.2fV Temp=%dC",
                      (unsigned long)bms_flags,
                      (unsigned)error_flags,
@@ -444,8 +616,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg)
             if (data_cb) {
                 victron_data_t parsed = {
                     .type = VICTRON_BLE_RECORD_SMART_LITHIUM,
-                    .product_id = product_id
+                    .product_id = product_id,
+                    .slot = (uint8_t)slot
                 };
+                memcpy(parsed.mac, src_mac, 6);
                 parsed.record.lithium.bms_flags = bms_flags;
                 parsed.record.lithium.error_flags = error_flags;
                 parsed.record.lithium.cell1_centi = cell_values[0];

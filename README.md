@@ -60,6 +60,33 @@ Below are screenshots of the device UI, showing both the Live tab and various Se
   - AES key, Wi-Fi settings, and display brightness are stored in NVS.
   - Default AES key is used if none is set by the user.
 
+---
+
+## Multi-Device Monitoring (3 independent devices)
+
+This fork adds support for monitoring up to **3 separate Victron BLE devices at once**, each on its own tab with its own AES key. This replaces the original single-device/single-key behaviour.
+
+### How it works
+
+- **3 device slots** (`VICTRON_MAX_DEVICES = 3` in `config_storage.h`). Each slot has:
+  - an enable flag,
+  - a user label (used as the tab name),
+  - a device type (Battery Monitor / DC/DC Converter / Solar Charger / Orion XS / Inverter / Smart Lithium / Auto),
+  - a BLE MAC address (auto-learned, or manually set),
+  - its own 16-byte AES key.
+- **Per-device tabs**: the single "Live" tab is replaced by three device tabs plus the existing Settings and Relay tabs. Each device tab shows its own dashboard, updated independently.
+- **MAC-based routing with auto-learn**: incoming Victron advertisements are matched to a slot by MAC. When a slot has a key but no MAC yet, the first packet whose key[0] and record type both match is bound automatically, so you usually only need to enter the 3 keys and types — the MACs populate themselves.
+- **Per-device AES keys**: each device decrypts with its own key. A blank key falls back to the project default key.
+- **Relay control is preserved** exactly as before (Relay tab + Relay Configuration in Settings).
+
+### Configuration
+
+- **On device**: open *Settings → Devices*. Configure each of the three devices (enable, name, type, MAC, AES key) and press *Save Devices*.
+- **Web portal**: the SoftAP configuration page now accepts three devices (name, type, key) and persists them on *Save Devices*.
+- **Migration**: on first boot after upgrading, the previous single AES key (NVS `victron/aes_key`) is migrated into device slot 0 so existing setups keep working.
+
+---
+
 ## Latest Release
 
 - **1.1.0** adds full Victron Battery Monitor (record type 0x02) support alongside Solar Charger (record type 0x01) telemetry with automatic UI updates.

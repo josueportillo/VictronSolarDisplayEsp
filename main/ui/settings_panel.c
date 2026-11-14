@@ -9,6 +9,7 @@
 #include "config_storage.h"
 #include "config_server.h"
 #include "display.h"
+#include "ui.h"
 #include "ui/relay_panel.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -18,13 +19,13 @@
 #define WIFI_NAMESPACE "wifi"
 
 static const char *TAG_SETTINGS = "UI_SETTINGS";
-static const char *APP_VERSION = "1.3.0";
+static const char *APP_VERSION = "2.0.0";
 
 static void ta_event_cb(lv_event_t *e);
 static void wifi_event_cb(lv_event_t *e);
 static void ap_checkbox_event_cb(lv_event_t *e);
 static void password_toggle_btn_event_cb(lv_event_t *e);
-static void save_key_btn_event_cb(lv_event_t *e);
+static void save_devices_btn_event_cb(lv_event_t *e);
 static void reboot_btn_event_cb(lv_event_t *e);
 static void brightness_slider_event_cb(lv_event_t *e);
 static void cb_screensaver_event_cb(lv_event_t *e);
@@ -55,6 +56,225 @@ static void relay_label_ta_event_cb(lv_event_t *e);
 
 static const uint8_t RELAY_GPIO_CHOICES[] = {5, 6, 7, 15, 16, 46, 9, 14};
 static const size_t RELAY_GPIO_COUNT = sizeof(RELAY_GPIO_CHOICES) / sizeof(RELAY_GPIO_CHOICES[0]);
+
+/* -------------------------------------------------------------------------- */
+/*  Device configuration (per-monitored-device)                               */
+/* -------------------------------------------------------------------------- */
+
+// Dropdown index -> record type value (0x00 = auto).
+static const uint8_t DEVICE_TYPE_VALUES[] = {0x00, 0x01, 0x02, 0x04, 0x0F, 0x03, 0x05};
+#define DEVICE_TYPE_OPTIONS "Auto\nSolar Charger\nBattery Monitor\nDC/DC Converter\nOrion XS\nInverter\nSmart Lithium"
+
+static uint16_t device_type_to_index(uint8_t type)
+{
+    for (uint16_t i = 0; i < sizeof(DEVICE_TYPE_VALUES); ++i) {
+        if (DEVICE_TYPE_VALUES[i] == type) return i;
+    }
+    return 0; // Auto
+}
+
+static void format_mac(const uint8_t mac[6], char *out, size_t out_len)
+{
+    snprintf(out, out_len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+}
+
+static bool parse_mac(const char *str, uint8_t out[6])
+{
+    if (str == NULL) return false;
+    unsigned m[6];
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
+               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) {
+        out[i] = (uint8_t)m[5 - i]; // BLE addr.val is little-endian
+    }
+    return true;
+}
+
+static bool key_text_to_bin(const char *hex, uint8_t out[16])
+{
+    if (hex == NULL || strlen(hex) != 32) return false;
+    for (int i = 0; i < 16; ++i) {
+        char tmp[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+        out[i] = (uint8_t)strtol(tmp, NULL, 16);
+    }
+    return true;
+}
+
+static void create_device_config_section(ui_state_t *ui, lv_obj_t *parent, size_t index)
+{
+    if (ui == NULL || parent == NULL || index >= VICTRON_MAX_DEVICES) {
+        return;
+    }
+
+    victron_device_config_t *cfg = &ui->device_config[index];
+
+    lv_obj_t *section = lv_obj_create(parent);
+    lv_obj_remove_style_all(section);
+    lv_obj_set_width(section, lv_pct(100));
+    lv_obj_set_height(section, LV_SIZE_CONTENT);
+    lv_obj_set_layout(section, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(section, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(section, 6, 0);
+
+    lv_obj_t *lbl = lv_label_create(section);
+    lv_obj_add_style(lbl, &ui->styles.medium, 0);
+    lv_label_set_text_fmt(lbl, "Device %u", (unsigned)(index + 1));
+
+    ui->device_ctrl[index].enable = lv_checkbox_create(section);
+    lv_checkbox_set_text(ui->device_ctrl[index].enable, "Enable");
+    lv_obj_add_style(ui->device_ctrl[index].enable, &ui->styles.small, 0);
+    if (cfg->enabled) {
+        lv_obj_add_state(ui->device_ctrl[index].enable, LV_STATE_CHECKED);
+    }
+
+    ui->device_ctrl[index].name_ta = lv_textarea_create(section);
+    lv_textarea_set_one_line(ui->device_ctrl[index].name_ta, true);
+    lv_textarea_set_max_length(ui->device_ctrl[index].name_ta, VICTRON_DEVICE_NAME_MAX - 1);
+    lv_obj_set_width(ui->device_ctrl[index].name_ta, lv_pct(70));
+    lv_textarea_set_placeholder_text(ui->device_ctrl[index].name_ta, "Name");
+    lv_textarea_set_text(ui->device_ctrl[index].name_ta, cfg->name);
+    lv_obj_add_style(ui->device_ctrl[index].name_ta, &ui->styles.small, 0);
+    lv_obj_add_event_cb(ui->device_ctrl[index].name_ta, ta_event_cb, LV_EVENT_FOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].name_ta, ta_event_cb, LV_EVENT_DEFOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].name_ta, ta_event_cb, LV_EVENT_READY, ui);
+
+    ui->device_ctrl[index].type_dd = lv_dropdown_create(section);
+    lv_dropdown_set_options(ui->device_ctrl[index].type_dd, DEVICE_TYPE_OPTIONS);
+    lv_obj_set_width(ui->device_ctrl[index].type_dd, lv_pct(70));
+    lv_dropdown_set_selected(ui->device_ctrl[index].type_dd, device_type_to_index(cfg->record_type));
+    lv_obj_add_style(ui->device_ctrl[index].type_dd, &ui->styles.small, 0);
+
+    char mac_str[18] = {0};
+    format_mac(cfg->mac, mac_str, sizeof(mac_str));
+    ui->device_ctrl[index].mac_ta = lv_textarea_create(section);
+    lv_textarea_set_one_line(ui->device_ctrl[index].mac_ta, true);
+    lv_obj_set_width(ui->device_ctrl[index].mac_ta, lv_pct(70));
+    lv_textarea_set_placeholder_text(ui->device_ctrl[index].mac_ta, "MAC (auto)");
+    lv_textarea_set_text(ui->device_ctrl[index].mac_ta, mac_str);
+    lv_obj_add_style(ui->device_ctrl[index].mac_ta, &ui->styles.small, 0);
+    lv_obj_add_event_cb(ui->device_ctrl[index].mac_ta, ta_event_cb, LV_EVENT_FOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].mac_ta, ta_event_cb, LV_EVENT_DEFOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].mac_ta, ta_event_cb, LV_EVENT_READY, ui);
+
+    char key_hex[33] = {0};
+    bool has_key = false;
+    for (int i = 0; i < 16; ++i) {
+        if (cfg->aes_key[i] != 0) { has_key = true; break; }
+    }
+    if (has_key) {
+        for (int i = 0; i < 16; ++i) {
+            sprintf(key_hex + i * 2, "%02X", cfg->aes_key[i]);
+        }
+    }
+    ui->device_ctrl[index].key_ta = lv_textarea_create(section);
+    lv_textarea_set_one_line(ui->device_ctrl[index].key_ta, true);
+    lv_obj_set_width(ui->device_ctrl[index].key_ta, lv_pct(90));
+    lv_textarea_set_placeholder_text(ui->device_ctrl[index].key_ta, "AES key (32 hex)");
+    lv_textarea_set_text(ui->device_ctrl[index].key_ta, key_hex);
+    lv_obj_add_style(ui->device_ctrl[index].key_ta, &ui->styles.small, 0);
+    lv_obj_add_event_cb(ui->device_ctrl[index].key_ta, ta_event_cb, LV_EVENT_FOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].key_ta, ta_event_cb, LV_EVENT_DEFOCUSED, ui);
+    lv_obj_add_event_cb(ui->device_ctrl[index].key_ta, ta_event_cb, LV_EVENT_READY, ui);
+}
+
+static void create_devices_settings_page(ui_state_t *ui, lv_obj_t *page_devices)
+{
+    if (ui == NULL || page_devices == NULL) {
+        return;
+    }
+
+    lv_obj_t *container = lv_obj_create(page_devices);
+    lv_obj_remove_style_all(container);
+    lv_obj_set_size(container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_layout(container, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(container, 10, 0);
+    lv_obj_set_style_pad_gap(container, 14, 0);
+    lv_obj_set_scroll_dir(container, LV_DIR_VER);
+
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        create_device_config_section(ui, container, i);
+    }
+
+    lv_obj_t *btn_save = lv_btn_create(container);
+    lv_obj_set_size(btn_save, 140, 45);
+    lv_obj_t *lbl_save = lv_label_create(btn_save);
+    lv_label_set_text(lbl_save, "Save Devices");
+    lv_obj_center(lbl_save);
+    lv_obj_add_event_cb(btn_save, save_devices_btn_event_cb, LV_EVENT_CLICKED, ui);
+    lv_obj_add_style(btn_save, &ui->styles.small, 0);
+}
+
+static void save_devices_btn_event_cb(lv_event_t *e)
+{
+    ui_state_t *ui = lv_event_get_user_data(e);
+    if (ui == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        victron_device_config_t *cfg = &ui->device_config[i];
+        ui_device_cfg_ctrl_t *ctl = &ui->device_ctrl[i];
+
+        if (ctl->enable != NULL) {
+            cfg->enabled = lv_obj_has_state(ctl->enable, LV_STATE_CHECKED) ? 1 : 0;
+        }
+        if (ctl->name_ta != NULL) {
+            const char *name = lv_textarea_get_text(ctl->name_ta);
+            strncpy(cfg->name, name ? name : "", VICTRON_DEVICE_NAME_MAX - 1);
+            cfg->name[VICTRON_DEVICE_NAME_MAX - 1] = '\0';
+        }
+        if (ctl->type_dd != NULL) {
+            uint16_t sel = lv_dropdown_get_selected(ctl->type_dd);
+            if (sel < sizeof(DEVICE_TYPE_VALUES)) {
+                cfg->record_type = DEVICE_TYPE_VALUES[sel];
+            }
+        }
+        if (ctl->mac_ta != NULL) {
+            const char *mac_txt = lv_textarea_get_text(ctl->mac_ta);
+            uint8_t mac[6] = {0};
+            if (parse_mac(mac_txt, mac)) {
+                memcpy(cfg->mac, mac, 6);
+            }
+            // Invalid/empty MAC -> leave unchanged (auto-learn fills it in).
+        }
+        if (ctl->key_ta != NULL) {
+            const char *key_txt = lv_textarea_get_text(ctl->key_ta);
+            if (key_txt != NULL && key_txt[0] != '\0') {
+                uint8_t key[16] = {0};
+                if (key_text_to_bin(key_txt, key)) {
+                    memcpy(cfg->aes_key, key, 16);
+                } else {
+                    ESP_LOGE(TAG_SETTINGS, "Device %u: invalid AES key (must be 32 hex)", (unsigned)i);
+                    continue;
+                }
+            } else {
+                memset(cfg->aes_key, 0, 16); // empty -> default key fallback
+            }
+        }
+    }
+
+    if (save_device_configs(ui->device_config, VICTRON_MAX_DEVICES) == ESP_OK) {
+        ESP_LOGI(TAG_SETTINGS, "Device configs saved");
+    } else {
+        ESP_LOGE(TAG_SETTINGS, "Failed to save device configs");
+    }
+
+    victron_ble_apply_device_configs(ui->device_config, VICTRON_MAX_DEVICES);
+
+    for (size_t i = 0; i < VICTRON_MAX_DEVICES; ++i) {
+        char tab_name[VICTRON_DEVICE_NAME_MAX];
+        if (ui->device_config[i].name[0] != '\0') {
+            snprintf(tab_name, sizeof(tab_name), "%s", ui->device_config[i].name);
+        } else {
+            snprintf(tab_name, sizeof(tab_name), "Device %u", (unsigned)(i + 1));
+        }
+        ui_rename_device_tab(ui, i, tab_name);
+    }
+}
 
 static void create_wifi_settings_page(ui_state_t *ui, lv_obj_t *page_wifi,
                                       const char *default_ssid,
@@ -350,45 +570,7 @@ static void create_system_settings_page(ui_state_t *ui, lv_obj_t *page_system)
     lv_obj_add_style(ui->lbl_error, &ui->styles.small, 0);
     lv_label_set_text(ui->lbl_error, "Err: 0");
 
-    /* --- MAC Address --- */
-    lv_obj_t *lbl_mac = lv_label_create(sys_container);
-    lv_obj_add_style(lbl_mac, &ui->styles.small, 0);
-    lv_label_set_text(lbl_mac, "MAC Address:");
-
-    ui->ta_mac = lv_textarea_create(sys_container);
-    lv_textarea_set_one_line(ui->ta_mac, true);
-    lv_obj_set_width(ui->ta_mac, lv_pct(50));
-    lv_textarea_set_text(ui->ta_mac, "00:00:00:00:00:00");
-    lv_obj_add_event_cb(ui->ta_mac, ta_event_cb, LV_EVENT_FOCUSED, ui);
-    lv_obj_add_event_cb(ui->ta_mac, ta_event_cb, LV_EVENT_DEFOCUSED, ui);
-    lv_obj_add_event_cb(ui->ta_mac, ta_event_cb, LV_EVENT_CANCEL, ui);
-    lv_obj_add_event_cb(ui->ta_mac, ta_event_cb, LV_EVENT_READY, ui);
-
-    /* --- AES Key --- */
-    lv_obj_t *lbl_key = lv_label_create(sys_container);
-    lv_obj_add_style(lbl_key, &ui->styles.small, 0);
-    lv_label_set_text(lbl_key, "AES Key:");
-
-    uint8_t aes_key_bin[16] = {0};
-    char aes_key_hex[33] = {0};
-    if (load_aes_key(aes_key_bin) == ESP_OK) {
-        for (int i = 0; i < 16; ++i) {
-            sprintf(aes_key_hex + i * 2, "%02X", aes_key_bin[i]);
-        }
-    } else {
-        strcpy(aes_key_hex, "00000000000000000000000000000000");
-    }
-
-    ui->ta_key = lv_textarea_create(sys_container);
-    lv_textarea_set_one_line(ui->ta_key, true);
-    lv_obj_set_width(ui->ta_key, lv_pct(80));
-    lv_textarea_set_text(ui->ta_key, aes_key_hex);
-    lv_obj_add_event_cb(ui->ta_key, ta_event_cb, LV_EVENT_FOCUSED, ui);
-    lv_obj_add_event_cb(ui->ta_key, ta_event_cb, LV_EVENT_DEFOCUSED, ui);
-    lv_obj_add_event_cb(ui->ta_key, ta_event_cb, LV_EVENT_CANCEL, ui);
-    lv_obj_add_event_cb(ui->ta_key, ta_event_cb, LV_EVENT_READY, ui);
-
-    /* --- Buttons Row (Save + Reboot) --- */
+    /* --- Buttons Row (Reboot) --- */
     lv_obj_t *btn_row = lv_obj_create(sys_container);
     lv_obj_remove_style_all(btn_row);
     lv_obj_set_width(btn_row, lv_pct(100));
@@ -397,15 +579,6 @@ static void create_system_settings_page(ui_state_t *ui, lv_obj_t *page_system)
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_gap(btn_row, 10, 0);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    /* Save Key Button */
-    lv_obj_t *btn_save_key = lv_btn_create(btn_row);
-    lv_obj_set_size(btn_save_key, 100, 45);
-    lv_obj_t *lbl_save = lv_label_create(btn_save_key);
-    lv_label_set_text(lbl_save, "Save");
-    lv_obj_center(lbl_save);
-    lv_obj_add_event_cb(btn_save_key, save_key_btn_event_cb, LV_EVENT_CLICKED, ui);
-    lv_obj_add_style(btn_save_key, &ui->styles.small, 0);
 
     /* Reboot Button */
     lv_obj_t *btn_reboot = lv_btn_create(btn_row);
@@ -465,6 +638,7 @@ void ui_settings_panel_init(ui_state_t *ui,
 
     lv_obj_t *page_display = lv_menu_page_create(menu, "Display");
     lv_obj_t *page_relay = lv_menu_page_create(menu, "Relay");
+    lv_obj_t *page_devices = lv_menu_page_create(menu, "Devices");
     lv_obj_t *page_system = lv_menu_page_create(menu, "System");
 
     lv_obj_t *cont;
@@ -494,10 +668,18 @@ void ui_settings_panel_init(ui_state_t *ui,
     lv_obj_add_style(label, &ui->styles.small, 0);
     lv_menu_set_load_page_event(menu, cont, page_relay);
 
-    // System & Victron Key
+    // Devices
     cont = lv_menu_cont_create(main_page);
     label = lv_label_create(cont);
-    lv_label_set_text(label, "System & Victron Key");
+    lv_label_set_text(label, "Devices");
+    lv_obj_add_style(cont, &ui->styles.small, 0);
+    lv_obj_add_style(label, &ui->styles.small, 0);
+    lv_menu_set_load_page_event(menu, cont, page_devices);
+
+    // System
+    cont = lv_menu_cont_create(main_page);
+    label = lv_label_create(cont);
+    lv_label_set_text(label, "System");
     lv_obj_add_style(cont, &ui->styles.small, 0);
     lv_obj_add_style(label, &ui->styles.small, 0);
     lv_menu_set_load_page_event(menu, cont, page_system);
@@ -507,6 +689,7 @@ void ui_settings_panel_init(ui_state_t *ui,
     create_wifi_settings_page(ui, page_wifi, default_ssid, default_pass, ap_enabled);
     create_display_settings_page(ui, page_display);
     create_relay_settings_page(ui, page_relay);
+    create_devices_settings_page(ui, page_devices);
     create_system_settings_page(ui, page_system);
 
     lv_obj_t *tab = ui->tab_settings;
@@ -527,14 +710,6 @@ void ui_settings_panel_init(ui_state_t *ui,
 void ui_settings_panel_on_user_activity(ui_state_t *ui)
 {
     screensaver_wake(ui);
-}
-
-void ui_settings_panel_set_mac(ui_state_t *ui, const char *mac_str)
-{
-    if (ui == NULL || ui->ta_mac == NULL || mac_str == NULL) {
-        return;
-    }
-    lv_textarea_set_text(ui->ta_mac, mac_str);
 }
 
 static void ta_event_cb(lv_event_t *e)
@@ -737,29 +912,6 @@ static void apply_relay_tab_state(ui_state_t *ui, bool enabled, bool update_chec
 
     if (previous_state != ui->relay_tab_enabled) {
         relay_config_persist(ui);
-    }
-}
-
-static void save_key_btn_event_cb(lv_event_t *e)
-{
-    ui_state_t *ui = lv_event_get_user_data(e);
-    if (ui == NULL || ui->ta_key == NULL) {
-        return;
-    }
-    const char *hex = lv_textarea_get_text(ui->ta_key);
-    if (strlen(hex) != 32) {
-        ESP_LOGE(TAG_SETTINGS, "AES key must be 32 hex chars");
-        return;
-    }
-    uint8_t key[16];
-    for (int i = 0; i < 16; i++) {
-        char tmp[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
-        key[i] = (uint8_t)strtol(tmp, NULL, 16);
-    }
-    if (save_aes_key(key) == ESP_OK) {
-        ESP_LOGI(TAG_SETTINGS, "AES key saved via UI");
-    } else {
-        ESP_LOGE(TAG_SETTINGS, "Failed to save AES key");
     }
 }
 

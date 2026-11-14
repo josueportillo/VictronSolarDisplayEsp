@@ -8,7 +8,6 @@
 
 struct ui_device_view;
 
-#define UI_MAX_DEVICE_VIEWS 32
 #define UI_MAX_RELAY_BUTTONS 8
 #define UI_RELAY_GPIO_UNASSIGNED UINT8_MAX
 
@@ -51,9 +50,26 @@ typedef struct {
     bool dropdown_updating;
 } ui_relay_config_t;
 
+// Per-monitored-device UI state (one tab + dashboard per device slot).
+typedef struct {
+    lv_obj_t *tab;
+    lv_obj_t *lbl_no_data;
+    struct ui_device_view *active_view;
+    victron_record_type_t current_device_type;
+    bool has_received_data;
+} ui_device_slot_t;
+
+// Per-device config controls in the Settings > Devices page.
+typedef struct {
+    lv_obj_t *enable;
+    lv_obj_t *name_ta;
+    lv_obj_t *type_dd;
+    lv_obj_t *mac_ta;
+    lv_obj_t *key_ta;
+} ui_device_cfg_ctrl_t;
+
 typedef struct ui_state {
     lv_obj_t *tabview;
-    lv_obj_t *tab_live;
     lv_obj_t *tab_settings;
     lv_obj_t *settings_menu;
     lv_obj_t *tab_relay;
@@ -61,20 +77,18 @@ typedef struct ui_state {
     ui_styles_t styles;
     ui_wifi_controls_t wifi;
     ui_screensaver_state_t screensaver;
+    // "Latest device" info shown in the System page (kept for alarm display).
     lv_obj_t *lbl_error;
     lv_obj_t *lbl_device_type;
     lv_obj_t *lbl_product_name;
-    lv_obj_t *lbl_no_data;
-    lv_obj_t *ta_mac;
-    lv_obj_t *ta_key;
     uint8_t brightness;
     bool victron_debug_enabled;
     lv_obj_t *victron_debug_checkbox;
-    victron_record_type_t current_device_type;
-    uint16_t current_product_id;
-    struct ui_device_view *active_view;
-    struct ui_device_view *views[UI_MAX_DEVICE_VIEWS];
-    bool has_received_data;
+    // Per-device tabs + dashboards.
+    ui_device_slot_t slots[VICTRON_MAX_DEVICES];
+    // Device config working copy + settings controls.
+    victron_device_config_t device_config[VICTRON_MAX_DEVICES];
+    ui_device_cfg_ctrl_t device_ctrl[VICTRON_MAX_DEVICES];
     lv_obj_t *relay_checkbox;
     uint16_t tab_settings_index;
     uint16_t tab_relay_index;
